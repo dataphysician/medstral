@@ -1,0 +1,18 @@
+[project]
+name = "medstral"
+version = "0.1.0"
+description = "Agentic ICD-10-CM medical coding harness"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.28",
+    "pydantic>=2.0",
+    "burr>=0.40",
+    "aiosqlite>=0.20",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.30",
+    "ag-ui-protocol>=0.1",
+    "python-dotenv>=1.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["agent*", "server*"]

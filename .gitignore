@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.sqlite
+.env
+*.egg-info/
+frontend/node_modules/
+frontend/dist/
+
+# Agent markdown files
+CLAUDE.md
+AGENT.md
