@@ -8,6 +8,16 @@ from dataclasses import dataclass, field
 import httpx
 from pydantic import BaseModel
 
+try:
+    from weave import op as weave_op
+except ImportError:
+
+    def weave_op(name: str = ""):  # type: ignore[assignment]
+        def _passthrough(fn):  # type: ignore[no-untyped-def]
+            return fn
+
+        return _passthrough
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -77,6 +87,7 @@ def _cache_key(messages: list[dict[str, str]], config: LLMConfig) -> str:
 # ---------------------------------------------------------------------------
 
 
+@weave_op(name="call_llm")
 async def call_llm(
     messages: list[dict[str, str]],
     config: LLMConfig,

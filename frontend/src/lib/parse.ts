@@ -2,8 +2,11 @@ import type {
   AGUIEvent,
   BatchDecision,
   BatchSnapshot,
+  DivergenceResult,
   FullStateSnapshot,
+  GoldTrajectory,
   LLMSettings,
+  PathComparison,
   PromptMessage,
 } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
@@ -290,6 +293,100 @@ export function buildCodePath(
   }
 
   return path;
+}
+
+// ---------------------------------------------------------------------------
+// LLMSettings validation (for localStorage)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Divergence computation (OPTIMIZE.md §3, §7.2)
+// ---------------------------------------------------------------------------
+
+export function normalizeIcd(code: string): string {
+  return code.replace(/\./g, "").toUpperCase();
+}
+
+export function longestCommonPrefix(a: string, b: string): string {
+  const n = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < n && a[i] === b[i]) i++;
+  return a.slice(0, i);
+}
+
+/**
+ * Compare a predicted path against a gold trajectory to produce a
+ * DivergenceResult with per-step match/mismatch, shaped score, and feedback.
+ */
+export function computeDivergence(
+  predPath: BatchDecision[],
+  goldTraj: GoldTrajectory,
+  predCode: string,
+): DivergenceResult {
+  const path: PathComparison[] = [];
+  let divergenceDepth: number | null = null;
+  let divergenceBatchId: string | null = null;
+
+  for (const batch of predPath) {
+    const d = batch.depth;
+    const goldNode = goldTraj.trajectory[String(d)] ?? null;
+    const match = goldNode !== null && batch.nodeId === goldNode;
+
+    path.push({
+      depth: d,
+      batchId: batch.batchId,
+      predNode: batch.nodeId,
+      goldNode,
+      match,
+    });
+
+    if (!match && divergenceDepth === null && d > 0) {
+      divergenceDepth = d;
+      divergenceBatchId = batch.batchId;
+    }
+  }
+
+  const normPred = normalizeIcd(predCode);
+  const normGold = normalizeIcd(goldTraj.goldCode);
+  const lcpStr = longestCommonPrefix(normPred, normGold);
+
+  let score: number;
+  if (normPred === normGold) {
+    score = 1.0;
+    divergenceDepth = null;
+    divergenceBatchId = null;
+  } else {
+    // If no path-level divergence was found but codes differ,
+    // the divergence is at the leaf level (last batch selected wrong code)
+    if (divergenceDepth === null && predPath.length > 0) {
+      const lastBatch = predPath[predPath.length - 1];
+      if (lastBatch) {
+        divergenceDepth = goldTraj.maxDepth;
+        divergenceBatchId = lastBatch.batchId;
+      }
+    }
+    const correctPrefixSteps =
+      divergenceDepth !== null ? divergenceDepth - 1 : 0;
+    score = 0.9 * (correctPrefixSteps / Math.max(goldTraj.maxDepth, 1));
+  }
+
+  const feedback =
+    divergenceDepth === null
+      ? "Exact match — no divergence detected."
+      : divergenceDepth === goldTraj.maxDepth
+        ? `Only the final extension differs; revise selector_d${divergenceDepth} to handle extension rules.`
+        : `Path diverged at depth ${divergenceDepth}; revise selector_d${divergenceDepth}.`;
+
+  return {
+    goldCode: goldTraj.goldCode,
+    predCode,
+    divergenceDepth,
+    divergenceBatchId,
+    lcp: lcpStr,
+    score,
+    path,
+    feedback,
+  };
 }
 
 // ---------------------------------------------------------------------------

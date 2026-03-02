@@ -10,6 +10,8 @@ import {
 import type {
   AGUIEvent,
   BatchDecision,
+  GepaLogEntry,
+  GepaResult,
   LLMSettings,
   TraversalRun,
 } from "../lib/types";
@@ -25,6 +27,8 @@ function makeRun(clinicalNote: string): TraversalRun {
     startTime: Date.now(),
     elapsedMs: 0,
     cached: false,
+    gepaLog: [],
+    gepaResult: null,
   };
 }
 
@@ -224,5 +228,26 @@ export function useTraversal() {
     [stop],
   );
 
-  return { run, start, stop } as const;
+  const updateRun = useCallback(
+    (batches: BatchDecision[], finalCodes: string[]) => {
+      batchesRef.current = batches;
+      setRun((prev) =>
+        prev
+          ? { ...prev, batches, finalCodes, status: "complete" as const }
+          : prev,
+      );
+    },
+    [],
+  );
+
+  const updateGepa = useCallback(
+    (log: GepaLogEntry[], result: GepaResult | null) => {
+      setRun((prev) =>
+        prev ? { ...prev, gepaLog: log, gepaResult: result } : prev,
+      );
+    },
+    [],
+  );
+
+  return { run, start, stop, updateRun, updateGepa } as const;
 }

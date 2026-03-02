@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from agent.actions import get_index
+from agent.actions import get_index, get_node
 from agent.llm import LLM_CONFIG, LLMConfig
 from agent.prompts import PromptBuilder
 from agent.traversal import build_traversal_app, generate_traversal_cache_key
@@ -28,6 +28,38 @@ def lcp(a: str, b: str) -> str:
     while i < n and a[i] == b[i]:
         i += 1
     return a[:i]
+
+
+def build_gold_trajectory(gold_code: str) -> tuple[dict[str, str], int]:
+    """Walk ICD-10 index upward from *gold_code* to ROOT.
+
+    Returns ``(trajectory, max_depth)`` where *trajectory* maps
+    depth strings (``"1"``, ``"2"``, ...) to the node-id at that depth.
+    Raises ``KeyError`` if *gold_code* is not in the index.
+    """
+    idx = get_index()
+    if gold_code not in idx:
+        raise KeyError(f"Code {gold_code!r} not found in ICD-10-CM index")
+
+    # Collect (depth, node_id) pairs walking upward
+    chain: list[tuple[int, str]] = []
+    current: str | None = gold_code
+    while current and current in idx:
+        node = idx[current]
+        depth: int = node["depth"]
+        chain.append((depth, current))
+        parent_map = node.get("parent", {})
+        current = next(iter(parent_map), None) if parent_map else None
+
+    # Build trajectory keyed by depth string, excluding ROOT (depth 0)
+    trajectory: dict[str, str] = {}
+    max_depth = 0
+    for d, nid in chain:
+        if d > 0:
+            trajectory[str(d)] = nid
+            max_depth = max(max_depth, d)
+
+    return trajectory, max_depth
 
 
 def is_ancestor(candidate: str, target: str) -> bool:

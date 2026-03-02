@@ -7,11 +7,11 @@ import PromptLog from "./components/PromptLog";
 import { useConfig } from "./hooks/useConfig";
 import { useTraversal } from "./hooks/useTraversal";
 import { sortBatchesDFS } from "./lib/parse";
-import type { BatchDecision, ChatMessage as Msg } from "./lib/types";
+import type { BatchDecision, ChatMessage as Msg, GepaLogEntry, GepaResult } from "./lib/types";
 
 export default function App() {
   const { settings, setSettings } = useConfig();
-  const { run, start } = useTraversal();
+  const { run, start, updateRun, updateGepa } = useTraversal();
   const [messages, setMessages] = useState<Msg[]>([]);
   const [configOpen, setConfigOpen] = useState(false);
   const [selectedBatch, setSelectedBatch] = useState<BatchDecision | null>(null);
@@ -72,6 +72,26 @@ export default function App() {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, run]);
 
+  const handleOptimizeComplete = useCallback(
+    (newBatches: BatchDecision[], newFinalCodes: string[]) => {
+      updateRun(newBatches, newFinalCodes);
+      // If the currently selected code is no longer in final codes,
+      // try to switch to the gold code if it is, otherwise deselect
+      setSelectedCode((prev) => {
+        if (prev && newFinalCodes.includes(prev)) return prev;
+        return null;
+      });
+    },
+    [updateRun],
+  );
+
+  const handleGepaLog = useCallback(
+    (log: GepaLogEntry[], result: GepaResult | null) => {
+      updateGepa(log, result);
+    },
+    [updateGepa],
+  );
+
   const isTraversing = run?.status === "traversing";
 
   // DFS-sorted batches for the prompt log (same order as the trace tree)
@@ -105,14 +125,20 @@ export default function App() {
             <CodeTraversal
               code={selectedCode}
               batches={logBatches}
+              clinicalNote={run?.clinicalNote ?? ""}
+              settings={settings}
               onToggleBatch={toggleBatch}
               onBack={() => setSelectedCode(null)}
+              onOptimizeComplete={handleOptimizeComplete}
+              onGepaLog={handleGepaLog}
             />
           ) : (
             <PromptLog
               batches={logBatches}
               status={run?.status ?? "idle"}
               selectedBatchId={selectedBatch?.batchId ?? null}
+              gepaLog={run?.gepaLog ?? []}
+              gepaResult={run?.gepaResult ?? null}
             />
           )}
         </div>

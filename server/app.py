@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -35,9 +35,20 @@ from agent.traversal import (
     retry_node,
 )
 from agent.zero_shot import build_zero_shot_app, cleanup_zs_persister
-from server.payloads import RewindRequest, TraversalRequest
+from agent.benchmark import build_gold_trajectory
+from agent.gepa_optimize import run_gepa_optimize
+from agent.observability import init_weave, make_weave_callback
+from server.payloads import (
+    GepaOptimizeRequest,
+    GoldTrajectoryRequest,
+    GoldTrajectoryResponse,
+    OptimizeRequest,
+    RewindRequest,
+    TraversalRequest,
+)
 
 load_dotenv()
+init_weave()
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -151,10 +162,10 @@ async def _stream_scaffolded(
     def batch_callback(**kwargs: Any) -> None:
         events_queue.put_nowait(kwargs)
 
-    # Set the callback
+    # Set the callback (chain weave tracing before the queue)
     from agent import actions
     prev_cb = actions.BATCH_CALLBACK
-    actions.BATCH_CALLBACK = batch_callback
+    actions.BATCH_CALLBACK = make_weave_callback(batch_callback)
 
     # Initial state snapshot
     yield _sse(StateSnapshotEvent(snapshot={"batch_data": {}, "final_nodes": []}))
@@ -287,6 +298,288 @@ async def traverse_rewind(body: RewindRequest) -> StreamingResponse:
         except Exception as e:
             logger.exception("Rewind error")
             yield _sse(RunErrorEvent(message=str(e), code="REWIND_ERROR"))
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# POST /api/evaluate/gold-trajectory — lookup gold trajectory (JSON)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/evaluate/gold-trajectory")
+async def gold_trajectory(body: GoldTrajectoryRequest) -> GoldTrajectoryResponse:
+    """Return the depth-indexed trajectory for a gold ICD-10-CM code."""
+    try:
+        traj, max_depth = build_gold_trajectory(body.gold_code)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return GoldTrajectoryResponse(
+        gold_code=body.gold_code,
+        trajectory=traj,
+        max_depth=max_depth,
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/optimize/stream — rewind + re-traverse with augmented prompt (AG-UI SSE)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/optimize/stream")
+async def optimize_stream(body: RunAgentInput) -> StreamingResponse:
+    """Rewind to divergence batch and re-traverse with augmented prompt."""
+    state_data: dict = body.state or {}
+    req = OptimizeRequest(**state_data)
+
+    api_key = req.api_key or os.getenv("MISTRAL_API_KEY", "")
+    if not api_key:
+        async def _err():
+            yield _sse(RunErrorEvent(message="No API key provided", code="NO_API_KEY"))
+        return StreamingResponse(_err(), media_type="text/event-stream")
+
+    llm.LLM_CONFIG = LLMConfig(
+        api_key=api_key,
+        model=req.model or "mistral-small-latest",
+        temperature=req.temperature if req.temperature is not None else 0.0,
+        max_completion_tokens=req.max_tokens or 8000,
+    )
+
+    config = llm.LLM_CONFIG
+    key = generate_traversal_cache_key(
+        req.clinical_note, config.model, config.temperature
+    )
+
+    # Build augmented instruction template with divergence feedback
+    base_prompt = DefaultScaffoldedPrompt()
+    augmented_instruction = base_prompt.instruction_template
+    if req.gold_code:
+        augmented_instruction += (
+            f"\n\nIMPORTANT CORRECTION: The expected code is {req.gold_code}. "
+            f"Re-evaluate candidates carefully at this depth."
+        )
+    if req.feedback:
+        augmented_instruction += f"\n\nClinician feedback: {req.feedback}"
+
+    pb = DefaultScaffoldedPrompt()
+    pb.instruction_template = augmented_instruction
+
+    thread_id = body.thread_id or uuid.uuid4().hex[:16]
+    run_id = body.run_id or _run_id()
+
+    async def event_stream():
+        yield _sse(RunStartedEvent(thread_id=thread_id, run_id=run_id))
+
+        try:
+            # Set up batch callback for real-time streaming
+            events_queue: asyncio.Queue = asyncio.Queue()
+
+            def batch_callback(**kwargs: Any) -> None:
+                events_queue.put_nowait(kwargs)
+
+            from agent import actions
+            prev_cb = actions.BATCH_CALLBACK
+            actions.BATCH_CALLBACK = make_weave_callback(batch_callback)
+
+            # Run retry_node in a background task
+            run_task = asyncio.create_task(
+                retry_node(
+                    batch_id=req.batch_id,
+                    clinical_note=req.clinical_note,
+                    partition_key=key,
+                    prompt_builder=pb,
+                )
+            )
+
+            # Stream per-batch events as they arrive
+            while not run_task.done():
+                try:
+                    batch_info = await asyncio.wait_for(
+                        events_queue.get(), timeout=0.5
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                batch_id = batch_info["batch_id"]
+                yield _sse(StepStartedEvent(step_name=batch_id))
+                yield _sse(StateSnapshotEvent(snapshot=batch_info))
+                if batch_info.get("reasoning"):
+                    yield _sse(CustomEvent(
+                        name="reasoning",
+                        value={
+                            "batch_id": batch_id,
+                            "reasoning": batch_info["reasoning"],
+                        },
+                    ))
+                yield _sse(StepFinishedEvent(step_name=batch_id))
+
+            # Drain remaining events
+            while not events_queue.empty():
+                batch_info = events_queue.get_nowait()
+                batch_id = batch_info["batch_id"]
+                yield _sse(StepStartedEvent(step_name=batch_id))
+                yield _sse(StateSnapshotEvent(snapshot=batch_info))
+                yield _sse(StepFinishedEvent(step_name=batch_id))
+
+            # Get final state
+            final_state = run_task.result()
+            yield _sse(StateSnapshotEvent(snapshot=_state_snapshot(final_state)))
+
+            # Restore callback
+            actions.BATCH_CALLBACK = prev_cb
+
+            yield _sse(RunFinishedEvent(thread_id=thread_id, run_id=run_id))
+        except Exception as e:
+            logger.exception("Optimize error")
+            yield _sse(RunErrorEvent(message=str(e), code="OPTIMIZE_ERROR"))
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# POST /api/gepa/optimize/stream — GEPA evolutionary prompt optimization (AG-UI SSE)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/gepa/optimize/stream")
+async def gepa_optimize_stream(body: RunAgentInput) -> StreamingResponse:
+    """Run GEPA evolutionary prompt optimization, streaming progress."""
+    state_data: dict = body.state or {}
+    req = GepaOptimizeRequest(**state_data)
+
+    api_key = req.api_key or os.getenv("MISTRAL_API_KEY", "")
+    if not api_key:
+        async def _err():
+            yield _sse(RunErrorEvent(message="No API key provided", code="NO_API_KEY"))
+        return StreamingResponse(_err(), media_type="text/event-stream")
+
+    config = LLMConfig(
+        api_key=api_key,
+        model=req.model or "mistral-small-latest",
+        temperature=req.temperature if req.temperature is not None else 0.0,
+        max_completion_tokens=req.max_tokens or 8000,
+    )
+    llm.LLM_CONFIG = config
+
+    thread_id = body.thread_id or uuid.uuid4().hex[:16]
+    run_id = body.run_id or _run_id()
+
+    async def event_stream():
+        yield _sse(RunStartedEvent(thread_id=thread_id, run_id=run_id))
+
+        events_queue: asyncio.Queue = asyncio.Queue()
+
+        def gepa_callback(event_type: str, data: dict) -> None:
+            events_queue.put_nowait((event_type, data))
+
+        try:
+            # Run GEPA in background thread, receiving progress via callback
+            gepa_task = asyncio.create_task(
+                run_gepa_optimize(
+                    clinical_note=req.clinical_note,
+                    gold_codes=req.gold_codes,
+                    llm_config=config,
+                    num_iters=req.num_iters,
+                    callback=gepa_callback,
+                )
+            )
+
+            current_iter = 0
+
+            while not gepa_task.done():
+                try:
+                    evt_type, evt_data = await asyncio.wait_for(
+                        events_queue.get(), timeout=0.5
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                iteration = evt_data.get("iteration", current_iter)
+
+                if evt_type == "gepa_iteration_start":
+                    current_iter = iteration
+                    yield _sse(StepStartedEvent(step_name=f"gepa_iter_{iteration}"))
+                    yield _sse(CustomEvent(
+                        name="gepa_log",
+                        value=evt_data,
+                    ))
+
+                elif evt_type == "gepa_mutation":
+                    yield _sse(CustomEvent(
+                        name="gepa_mutation",
+                        value=evt_data,
+                    ))
+
+                elif evt_type in ("gepa_accepted", "gepa_rejected"):
+                    yield _sse(CustomEvent(
+                        name=evt_type,
+                        value=evt_data,
+                    ))
+                    yield _sse(StepFinishedEvent(step_name=f"gepa_iter_{iteration}"))
+
+                elif evt_type == "gepa_base_score":
+                    yield _sse(CustomEvent(
+                        name="gepa_base_score",
+                        value=evt_data,
+                    ))
+
+                elif evt_type == "gepa_result":
+                    yield _sse(CustomEvent(
+                        name="gepa_result",
+                        value=evt_data,
+                    ))
+
+                else:
+                    yield _sse(CustomEvent(
+                        name="gepa_log",
+                        value=evt_data,
+                    ))
+
+            # Drain remaining events
+            while not events_queue.empty():
+                evt_type, evt_data = events_queue.get_nowait()
+                yield _sse(CustomEvent(name=evt_type, value=evt_data))
+
+            # Get final result
+            result = gepa_task.result()
+
+            # Re-run traversal with the best prompt to get fresh batch_data
+            best_candidate = result.get("best_candidate", {})
+            best_instruction = best_candidate.get("instruction_template", "")
+
+            if best_instruction:
+                from agent.prompts import DefaultScaffoldedPrompt as DSP
+                pb = DSP()
+                pb.instruction_template = best_instruction
+
+                key = generate_traversal_cache_key(
+                    req.clinical_note, config.model, config.temperature
+                ) + "_gepa_final"
+
+                from agent import actions
+                prev_cb = actions.BATCH_CALLBACK
+                actions.BATCH_CALLBACK = None
+
+                try:
+                    final_app, _ = await build_traversal_app(
+                        context=req.clinical_note,
+                        partition_key=key,
+                        prompt_builder=pb,
+                        persist_cache=False,
+                    )
+                    _, _, final_state = await final_app.arun(
+                        halt_after=["finish"], inputs={}
+                    )
+                    yield _sse(StateSnapshotEvent(
+                        snapshot=_state_snapshot(final_state)
+                    ))
+                finally:
+                    actions.BATCH_CALLBACK = prev_cb
+
+            yield _sse(RunFinishedEvent(thread_id=thread_id, run_id=run_id))
+        except Exception as e:
+            logger.exception("GEPA optimize error")
+            yield _sse(RunErrorEvent(message=str(e), code="GEPA_ERROR"))
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

@@ -52,6 +52,8 @@ export interface TraversalRun {
   startTime: number;
   elapsedMs: number;
   cached: boolean;
+  gepaLog: GepaLogEntry[];
+  gepaResult: GepaResult | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +67,57 @@ export interface ChatMessage {
   role: MessageRole;
   content: string;
   run?: TraversalRun;
+}
+
+// ---------------------------------------------------------------------------
+// Evaluate & Optimize types
+// ---------------------------------------------------------------------------
+
+export interface GoldTrajectory {
+  goldCode: string;
+  trajectory: Record<string, string>;
+  maxDepth: number;
+}
+
+export interface PathComparison {
+  depth: number;
+  batchId: string;
+  predNode: string;
+  goldNode: string | null;
+  match: boolean;
+}
+
+export interface DivergenceResult {
+  goldCode: string;
+  predCode: string;
+  divergenceDepth: number | null;
+  divergenceBatchId: string | null;
+  lcp: string;
+  score: number;
+  path: PathComparison[];
+  feedback: string;
+}
+
+// ---------------------------------------------------------------------------
+// GEPA optimization types
+// ---------------------------------------------------------------------------
+
+export interface GepaLogEntry {
+  type: "log" | "mutation" | "accepted" | "rejected" | "base_score" | "iteration_start";
+  iteration: number;
+  message: string;
+  timestamp: number;
+  component?: string;
+  oldText?: string;
+  newText?: string;
+  score?: number;
+}
+
+export interface GepaResult {
+  bestCandidate: Record<string, string>;
+  bestScore: number;
+  candidates: { candidate: Record<string, string>; score: number }[];
+  totalIterations: number;
 }
 
 // ---------------------------------------------------------------------------
